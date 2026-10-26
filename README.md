@@ -112,6 +112,17 @@ or `php71-runtime`. PECL extensions keep working because the PHP API/ABI is unch
 returns to exactly the versions it had. Configuration files are not restored
 automatically; the backup path is printed.
 
+**Packages replaced by the install.** The patched `php-gd` links Remi's `gd3php`, which
+obsoletes `gd-last`. On a server whose current `php-gd` is an older build that needs
+`gd-last` (`libgd.so.3`), yum therefore removes `gd-last` during the install. The script
+detects this beforehand (yum dry run), backs `gd-last` up together with the PHP RPMs, and
+`uninstall` puts it back and removes `gd3php` again once nothing needs it.
+
+**Known limitation:** when base `php-gd` and SCL `php71-php-gd` are both installed and
+both are such older builds, each install type's transaction would remove `gd-last` that
+the other one still needs. yum refuses that transaction and nothing is changed ("yum
+install failed"). Upgrade or remove one of the two `gd` packages first.
+
 ### Rollback backups
 
 yum does not keep the `.rpm` files of installed packages by default (`keepcache=0`), and
@@ -287,6 +298,10 @@ Tested in clean CentOS 7 containers against Remi's last EL7 packages, `7.1.33-29
 - **Not run for 7.1:** the php-src test suite (it was run for the 7.0 port the 7.1 patch
   is based on: the only differences from the unpatched packages were the expected
   `session.upload_progress` tests and one cosmetic out-of-memory message).
+- **`gd-last` replaced by the install:** an SCL server whose `php71-php-gd` needs `gd-last`
+  (as older Remi builds do). The install removed `gd-last`; `uninstall` restored it from
+  the backup, removed `gd3php`, and the old `gd` extension loaded again with no unsatisfied
+  dependencies in the RPM database (8 checks).
 - **Not covered:** real systemd and Apache. The containers used a stub `systemctl`. Run
   `status` and `install` on one server and check the output before rolling out further.
 
