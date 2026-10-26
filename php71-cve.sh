@@ -53,6 +53,7 @@ PKGS_base="php php-bcmath php-cli php-common php-dba php-dbg php-devel php-embed
 PKGS_scl="php71-php php71-php-bcmath php71-php-cli php71-php-common php71-php-dba php71-php-dbg php71-php-devel php71-php-embedded php71-php-enchant php71-php-fpm php71-php-gd php71-php-gmp php71-php-imap php71-php-interbase php71-php-intl php71-php-json php71-php-ldap php71-php-litespeed php71-php-mbstring php71-php-mcrypt php71-php-mysqlnd php71-php-odbc php71-php-opcache php71-php-pdo php71-php-pdo-dblib php71-php-pgsql php71-php-process php71-php-pspell php71-php-recode php71-php-snmp php71-php-soap php71-php-tidy php71-php-xml php71-php-xmlrpc"
 
 ASSUME_YES=0
+INSTALLED=""   # install types upgraded by this run
 CMD=${1:-status}
 [ "${2:-}" = "-y" ] && ASSUME_YES=1
 
@@ -121,11 +122,12 @@ fetch_rpms() {
     tar xzf "$f" -C "$HERE" || die "could not extract $ASSET"
 }
 
-# PHP 7.1 install types on this server (base / scl)
+# PHP 7.1 install types on this server (scl / base), in install order: scl first, so that a
+# base php-gd taking over a hand-copied gd.so (see adoptable) finds gd3php already in place
 detect_modes() {
     local v
-    v=$(rpm -q --qf '%{VERSION}' php-common 2>/dev/null) && case $v in 7.1.*) echo base ;; esac
     rpm -q php71-php-common >/dev/null 2>&1 && echo scl
+    v=$(rpm -q --qf '%{VERSION}' php-common 2>/dev/null) && case $v in 7.1.*) echo base ;; esac
     return 0
 }
 
@@ -450,11 +452,26 @@ install_mode() {
         return 0
     fi
 
+    local adopt=() adopt_paths=() r f
+    while read -r name r; do
+        [ -n "$name" ] || continue
+        adopt+=("$name"); files+=("$r")
+        while read -r f; do
+            [ -e "$f" ] && [ ! -d "$f" ] && ! rpm -qf "$f" >/dev/null 2>&1 && adopt_paths+=("$f")
+        done < <(rpm -qpl "$r" 2>/dev/null)
+    done < <(adoptable)
+
     say "$TITLE: packages to upgrade (-> $PATCHED_VR)"
     printf '  %s\n' "${upgrade[@]}"
     if [ ${#skipped[@]} -gt 0 ]; then
         say "$TITLE: packages left as is"
         printf '  %s\n' "${skipped[@]}"
+    fi
+    if [ ${#adopt[@]} -gt 0 ]; then
+        say "$TITLE: also installed, their files are on disk without a package (copied by hand?)"
+        printf '  %s\n' "${adopt[@]}"
+        echo "  files replaced (backed up, put back by uninstall):"
+        printf '    %s\n' "${adopt_paths[@]}"
     fi
 
     if [ -x "$FPM" ] && ! "$FPM" -t >/dev/null 2>&1; then
@@ -475,6 +492,12 @@ install_mode() {
     printf '%s\n' "${upgrade[@]}" > "$backup/upgraded.txt"
     echo "$services" > "$backup/services.txt"
     for p in $CONF_PATHS; do [ -e "/$p" ] && existing+=("$p"); done
+    if [ ${#adopt[@]} -gt 0 ]; then
+        printf '%s\n' "${adopt[@]}" > "$backup/adopted.txt"
+        tar czf "$backup/adopted-files.tar.gz" -P "${adopt_paths[@]}" ||
+            { rm -rf "$backup"; die "could not back up ${adopt_paths[*]}"; }
+        echo "  files replaced by ${adopt[*]}: $backup/adopted-files.tar.gz"
+    fi
     if [ ${#existing[@]} -gt 0 ] && tar czf "$backup/config.tar.gz" -C / "${existing[@]}" 2>/dev/null; then
         echo "  configuration: $backup/config.tar.gz"
     fi
@@ -531,11 +554,40 @@ install_mode() {
     fi
 
     if [ "$failed" = 1 ]; then
-        warn "Verification failed, rolling back automatically ($TITLE)"
-        ASSUME_YES=1 uninstall_mode
+        warn "Verification failed, rolling back automatically ($TITLE${INSTALLED:+ and the install types upgraded before it})"
+        INSTALLED="$INSTALLED $MODE"
+        rollback_run
         die "the install was rolled back"
     fi
+    INSTALLED="$INSTALLED $MODE"
     say "Done: $TITLE upgraded to the patched version ($PATCHED_VR)"
+}
+
+# Patched packages that are not installed, but whose PHP extension (.so) is on disk without
+# an owning package: an extension copied by hand from another build, e.g.
+# /usr/lib64/php/modules/gd.so without php-gd. Such a file keeps its old library
+# dependencies (gd.so -> libgd.so.3 from gd-last) that rpm does not know about, so it breaks
+# when the install replaces that library. Installing the patched package puts a packaged
+# extension in its place. Prints "NAME RPMFILE" per package.
+adoptable() {
+    local r n f
+    for r in "$RPM_DIR"/*.rpm; do
+        n=$(rpm -qp --qf '%{NAME}' "$r" 2>/dev/null) || continue
+        rpm -q "$n" >/dev/null 2>&1 && continue
+        while read -r f; do
+            case $f in *.so) ;; *) continue ;; esac
+            [ -e "$f" ] && ! rpm -qf "$f" >/dev/null 2>&1 && { echo "$n $r"; break; }
+        done < <(rpm -qpl "$r" 2>/dev/null)
+    done
+}
+
+# roll back every install type upgraded by this run, in reverse install order, so that the
+# server ends up as it was (one install type may have replaced a library the other needs)
+rollback_run() {
+    local m
+    for m in base scl; do
+        case " $INSTALLED " in *" $m "*) set_mode "$m"; ASSUME_YES=1 uninstall_mode ;; esac
+    done
 }
 
 # Remove the dependencies the install added (backup/added.txt, e.g. gd3php) once nothing
@@ -578,8 +630,8 @@ uninstall_mode() {
             repo_pkgs+=("$name")
         fi
     done < "$backup/upgraded.txt"
-    # Packages an install replaced (see install_mode). Both install types are checked: when
-    # base was installed first, it replaced gd-last, and the old scl packages need it too.
+    # Packages an install replaced (see install_mode). Both install types are checked: the
+    # install type that replaced gd-last may not be the only one whose old packages need it.
     local arch b r
     for b in "$backup" "$STATE_ROOT"/*/current; do
         [ -f "$b/replaced.txt" ] || continue
@@ -610,6 +662,16 @@ uninstall_mode() {
     [ ${#repo_pkgs[@]} -gt 0 ] && printf '  %s -> newest version in the repositories\n' "${repo_pkgs[@]}"
     confirm "Continue?" || die "aborted"
 
+    # packages the install added in place of hand-copied files: remove them, put the files back
+    if [ -s "$backup/adopted.txt" ]; then
+        local adopted
+        adopted=$(rpm -q --qf '%{NAME}\n' $(cat "$backup/adopted.txt") 2>/dev/null | grep -v ' ')
+        if [ -n "$adopted" ]; then
+            rpm -e $adopted || die "could not remove $adopted"
+        fi
+        tar xzf "$backup/adopted-files.tar.gz" -P || die "could not restore the files from $backup/adopted-files.tar.gz"
+        echo "  removed $(echo $adopted), restored: $(tar tzf "$backup/adopted-files.tar.gz" -P | tr '\n' ' ')"
+    fi
     if [ ${#local_rpms[@]} -gt 0 ]; then
         # A restored replaced package is "obsoleted by (installed)" its replacement (gd-last
         # by gd3php), which rpm refuses. When that is the only problem, install without the
@@ -649,8 +711,8 @@ main() {
 
     if [ "$CMD" = uninstall ]; then
         # rollback: every install type installed by this script, in reverse install order
-        # (base installs first, so its new dependencies such as gd3php go last)
-        modes=$(for m in scl base; do [ -L "$STATE_ROOT/$m/current" ] && echo $m; done)
+        # (scl installs first, so its new dependencies such as gd3php go last)
+        modes=$(for m in base scl; do [ -L "$STATE_ROOT/$m/current" ] && echo $m; done)
         [ -n "$modes" ] || die "nothing to roll back ($STATE_ROOT); nothing was installed by this script"
     else
         print_discovery
@@ -669,6 +731,17 @@ main() {
             uninstall) uninstall_mode ;;
         esac
     done
+    # With both install types, a later transaction can break the PHP checked earlier (for
+    # example by replacing a library its extensions use): check every one again.
+    if [ "$CMD" = install ] && [ -n "$INSTALLED" ] && [ "$(echo $modes | wc -w)" -gt 1 ]; then
+        local failed=0
+        for m in $modes; do set_mode "$m"; verify || failed=1; done
+        if [ "$failed" = 1 ]; then
+            warn "Final verification failed, rolling back automatically"
+            rollback_run
+            die "the install was rolled back"
+        fi
+    fi
     [ "$CMD" = install ] && say "To roll back: $0 uninstall"
     return 0
 }
